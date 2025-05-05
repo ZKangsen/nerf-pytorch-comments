@@ -176,23 +176,34 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
     return rgbs, disps
 
-
+# 用来创建nerf的MLP网络
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
+    # 获取位置编码函数和通道数，对应paper中的
+    # [sin(2**0*pi*p),cos(2**0*pi*p), ... sin(2**(L-1)*pi*p), cos(2**(L-1)*pi*p)]
+    # multires就是L，i_embed为0时使用默认位置编码，为1时不使用位置编码
+    # embed_fn:位置编码函数; input_ch: 位置编码后的输出通道数(L * 2 * 3 + 3=6L+3)
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
 
     input_ch_views = 0
     embeddirs_fn = None
+    # 如果使用视角方向，则获取方向编码函数和通道数，类似embed_fn, input_ch
     if args.use_viewdirs:
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
+    # 如果N_importance>0(即精网络采样点数>0)，则设置输出通道为5(rgb+sigma+权重/置信度之类的)，否则设为4(rgb+sigma)
     output_ch = 5 if args.N_importance > 0 else 4
+    # skip=4表示将MLP第5层网络的输出和原始位置编码连接后, 作为第6层的输入
     skips = [4]
+    # 创建nerf的MLP网络，并放入device
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+    # 获取模型参数并转为list
     grad_vars = list(model.parameters())
 
+    # 如果N_importance>0, 创建精网络，类似上面model
+    # paper中说的两个网络，一个coarse(model)，一个fine(model_fine)
     model_fine = None
     if args.N_importance > 0:
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
@@ -200,21 +211,22 @@ def create_nerf(args):
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
         grad_vars += list(model_fine.parameters())
 
+    # 运行网络的查询函数，实际调用的run_network
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
                                                                 netchunk=args.netchunk)
 
-    # Create optimizer
+    # 创建Adam优化器
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
 
-    start = 0
-    basedir = args.basedir
-    expname = args.expname
+    start = 0 # 训练起始id
+    basedir = args.basedir # log路径
+    expname = args.expname # 实验名称
 
     ##########################
 
-    # Load checkpoints
+    # 加载之前训练时保存的checkpoints，用于断点处继续训练
     if args.ft_path is not None and args.ft_path!='None':
         ckpts = [args.ft_path]
     else:
@@ -224,39 +236,42 @@ def create_nerf(args):
     if len(ckpts) > 0 and not args.no_reload:
         ckpt_path = ckpts[-1]
         print('Reloading from', ckpt_path)
+        # 加载checkpoint
         ckpt = torch.load(ckpt_path)
-
+        # 读取global_step更新start
         start = ckpt['global_step']
+        # 加载优化参数
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
 
-        # Load model
+        # 加载MLP模型
         model.load_state_dict(ckpt['network_fn_state_dict'])
         if model_fine is not None:
             model_fine.load_state_dict(ckpt['network_fine_state_dict'])
 
     ##########################
-
+    # 将所需数据组织为字典
+    # 训练时的渲染参数
     render_kwargs_train = {
-        'network_query_fn' : network_query_fn,
-        'perturb' : args.perturb,
-        'N_importance' : args.N_importance,
-        'network_fine' : model_fine,
-        'N_samples' : args.N_samples,
-        'network_fn' : model,
-        'use_viewdirs' : args.use_viewdirs,
-        'white_bkgd' : args.white_bkgd,
-        'raw_noise_std' : args.raw_noise_std,
+        'network_query_fn' : network_query_fn, # 网络查询函数
+        'perturb' : args.perturb, # 分层随机采样
+        'N_importance' : args.N_importance, # 精网络的采样点数(或者叫重要性采样)
+        'network_fine' : model_fine,  # 精网络
+        'N_samples' : args.N_samples, # 粗网络采样点数
+        'network_fn' : model, # MLP模型
+        'use_viewdirs' : args.use_viewdirs, # 使用视角方向
+        'white_bkgd' : args.white_bkgd, # 白色背景(针对blender合成数据的)
+        'raw_noise_std' : args.raw_noise_std, # 噪声标准差，paper中为体密度加的高斯噪声，提升训练效果
     }
 
-    # NDC only good for LLFF-style forward facing data
+    # NDC坐标只用于llff
     if args.dataset_type != 'llff' or args.no_ndc:
         print('Not ndc!')
         render_kwargs_train['ndc'] = False
-        render_kwargs_train['lindisp'] = args.lindisp
-
+        render_kwargs_train['lindisp'] = args.lindisp # 是否使用逆深度线性采样
+    # 测试时的渲染参数
     render_kwargs_test = {k : render_kwargs_train[k] for k in render_kwargs_train}
-    render_kwargs_test['perturb'] = False
-    render_kwargs_test['raw_noise_std'] = 0.
+    render_kwargs_test['perturb'] = False    # 不再进行分层采样
+    render_kwargs_test['raw_noise_std'] = 0. # 不加噪声
 
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
 
@@ -503,7 +518,7 @@ def config_parser():
     # 加载已有权重，只进行渲染，不进行优化，默认：false
     parser.add_argument("--render_only", action='store_true', 
                         help='do not optimize, reload weights and render out render_poses path')
-    # 渲染测试集
+    # 渲染测试集，默认：false
     parser.add_argument("--render_test", action='store_true', 
                         help='render the test set instead of render_poses path')
     # 降采样加速渲染
@@ -530,7 +545,7 @@ def config_parser():
     parser.add_argument("--shape", type=str, default='greek', 
                         help='options : armchair / cube / greek / vase')
 
-    # 白色背景：用于blender数据集，blender合成物体的背景是白色
+    # 白色背景：用于blender数据集，blender合成物体的背景是白色，默认：false
     parser.add_argument("--white_bkgd", action='store_true', 
                         help='set to render synthetic data on a white bkgd (always use for dvoxels)')
     # 加载blender数据时降采样为一半，默认：false
@@ -541,13 +556,13 @@ def config_parser():
     # llff图像降采样因子 
     parser.add_argument("--factor", type=int, default=8, 
                         help='downsample factor for LLFF images')
-    # 不使用NDC坐标（适用于非正对拍摄场景）
+    # 不使用NDC坐标（适用于非正对拍摄场景），默认：false
     parser.add_argument("--no_ndc", action='store_true', 
                         help='do not use normalized device coordinates (set for non-forward facing scenes)')
-    # 视差线性采样（即使用逆深度，而不是深度）
+    # 视差线性采样（即使用逆深度，而不是深度），默认：false
     parser.add_argument("--lindisp", action='store_true', 
                         help='sampling linearly in disparity rather than depth')
-    # 数据是周围360度场景图片时，设为True
+    # 数据是周围360度场景图片时，设为True，默认：false
     parser.add_argument("--spherify", action='store_true', 
                         help='set for spherical 360 scenes')
     # 每N张图像取1张作为llff测试集，paper中为8
@@ -585,7 +600,7 @@ def train():
     K = None # 内参
     # 加载LLFF数据
     if args.dataset_type == 'llff':
-        # images: 加载的图像，shape: [N_imgs, H, W, C]
+        # images: 加载的图像，shape: [N_imgs, H, W, C], 像素值已归一化(pixel/255.)
         # poses: 加载的相机poses，shape: [N_imgs, 3, 5], [R, t, hwf]->3x5
         # bds: bounds，加载的边界，用于计算近和远平面距离
         # render_poses: 待渲染的新视角
@@ -680,82 +695,108 @@ def train():
     if args.render_test:
         render_poses = np.array(poses[i_test])
 
-    # Create log dir and copy the config file
+    # 创建log文件夹并拷贝config文件
     basedir = args.basedir
     expname = args.expname
+    # 创建log文件夹：basedir/expname
     os.makedirs(os.path.join(basedir, expname), exist_ok=True)
+    # 创建参数文件：basedir/expname/args.txt
     f = os.path.join(basedir, expname, 'args.txt')
     with open(f, 'w') as file:
+        # 读取args中的所有参数并排序，然后写入文件
         for arg in sorted(vars(args)):
             attr = getattr(args, arg)
             file.write('{} = {}\n'.format(arg, attr))
+    # 拷贝config文件至 basedir/expname/config.txt
     if args.config is not None:
         f = os.path.join(basedir, expname, 'config.txt')
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
-    # Create nerf model
+    # 根据args创建nerf模型以及优化器等
+    # render_kwargs_train：训练用的渲染参数，包括MLP网络，网络查询函数，单射线采样点数等
+    # render_kwargs_test：测试用的渲染参数，类似render_kwargs_train
+    # start：训练迭代起始ID，无ckpt时为0，有ckpt时为已经训练过的step数，方便断点训练
+    # grad_vars：MLP模型参数
+    # optimizer： Adam优化器
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
+    # 训练迭代step
     global_step = start
 
+    # 近/远平面边界
     bds_dict = {
         'near' : near,
         'far' : far,
     }
+    # 更新近/远平面
     render_kwargs_train.update(bds_dict)
     render_kwargs_test.update(bds_dict)
 
-    # Move testing data to GPU
+    # 将render_poses放到device中(GPU/CPU)
     render_poses = torch.Tensor(render_poses).to(device)
 
-    # Short circuit if only rendering out from trained model
+    # 仅执行渲染（使用已有模型）
     if args.render_only:
         print('RENDER ONLY')
         with torch.no_grad():
+            # 如果render_test是true, 使用测试数据，并将images作为groundtruth进行对比
+            # 否则渲染更平滑的原始render_poses
             if args.render_test:
-                # render_test switches to test poses
                 images = images[i_test]
             else:
-                # Default is smoother render_poses path
                 images = None
 
+            # 测试结果保存路径
             testsavedir = os.path.join(basedir, expname, 'renderonly_{}_{:06d}'.format('test' if args.render_test else 'path', start))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', render_poses.shape)
-
+            # 根据render_poses, hwf和K进行模型渲染，得到一系列图像rgbs
             rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
             print('Done rendering', testsavedir)
+            # 将渲染结果保存至mp4
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
             return
 
-    # Prepare raybatch tensor if batching random rays
-    N_rand = args.N_rand
+    # 如果no_batching是false，即使用批量化训练，需要准备批量化的射线，即random ray batching
+    N_rand = args.N_rand # ray的batch size
     use_batching = not args.no_batching
-    if use_batching:
-        # For random ray batching
+    if use_batching: # 如果使用批量化
         print('get rays')
-        rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
+        # 获取N_imgs张图像的全部射线(每个像素对应的ray), 得到ray, shape: [N_imgs, ro+rd, H, W, 3], ro+rd=2
+        # ro: 相机原点(Ox,Oy,Oz); rd: 未归一化方向向量(dx, dy, dz)
+        rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0)
         print('done, concats')
-        rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
-        rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
-        rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
+        # 将图像进行连接得到rays_rgb, shape: [N_imgs, ro+rd+rgb, H, W, 3], ro+rd+rgb=3
+        # rgb: 归一化后的rgb, 即pixel/255.
+        rays_rgb = np.concatenate([rays, images[:,None]], 1)
+        # 将H,W和ro+rd+rgb进行转置，shape: [N_imgs, H, W, ro+rd+rgb, 3]
+        rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4])
+        # 根据i_train挑选出训练数据, rays_rgb.shape: [N_train, H, W, ro+rd+rgb, 3]
+        rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0)
+        # 将rays_rgb reshape为 [N_train*H*W, ro+rd+rgb, 3],便于随机选batch
+        rays_rgb = np.reshape(rays_rgb, [-1,3,3])
+        # 转类型，确保为float32
         rays_rgb = rays_rgb.astype(np.float32)
         print('shuffle rays')
+        # 随机打乱rays_rgb
         np.random.shuffle(rays_rgb)
 
         print('done')
+        # batch索引
         i_batch = 0
 
-    # Move training data to GPU
+    # 如果使用批量化训练，则将图像放入device
     if use_batching:
+        # images: [N_imgs, H, W, C]
         images = torch.Tensor(images).to(device)
+    # 将poses放入device
     poses = torch.Tensor(poses).to(device)
+    # 如果使用批量化训练，则将rays_rgb放入device
     if use_batching:
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
-
+    # 总迭代次数：200k+1
     N_iters = 200000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
@@ -766,47 +807,61 @@ def train():
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
     
     start = start + 1
+    # 迭代训练开始
     for i in trange(start, N_iters):
+        # 计时开始
         time0 = time.time()
 
-        # Sample random ray batch
+        # 随机采样ray batch
         if use_batching:
-            # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
+            # 取一个大小为N_rand的ray batch，shape: [N_rand, ro+rd+rgb, 3]
+            batch = rays_rgb[i_batch:i_batch+N_rand]
+            # 转置一下batch, shape: [ro+rd+rgb, N_rand, 3]
             batch = torch.transpose(batch, 0, 1)
+            # batch[0]为ro, batch[1]为rd, batch[2]为rgb
             batch_rays, target_s = batch[:2], batch[2]
 
+            # 更新i_batch
             i_batch += N_rand
+            # 如果i_batch>=rays_rgb总数，即遍历了整个训练images的所有rays
+            # 则重新打乱rays_rgb, 并将i_batch置0, 便于进行下轮训练
             if i_batch >= rays_rgb.shape[0]:
                 print("Shuffle data after an epoch!")
                 rand_idx = torch.randperm(rays_rgb.shape[0])
                 rays_rgb = rays_rgb[rand_idx]
                 i_batch = 0
 
-        else:
-            # Random from one image
+        else: # 从单张图像中随机选择rays
+            # 从训练ID中随机选择一个image
             img_i = np.random.choice(i_train)
             target = images[img_i]
+            # 将该图像放入device
             target = torch.Tensor(target).to(device)
+            # 获取该图像对应的pose
             pose = poses[img_i, :3,:4]
-
+            
+            # 如果N_rand非none，则在单张图像中随机采样N_rand个rays
             if N_rand is not None:
-                rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
-
+                # 计算单张图像所有像素对应的射线，rays_o和rays_d的shape：[H, W, 3]
+                rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))
+                
                 if i < args.precrop_iters:
-                    dH = int(H//2 * args.precrop_frac)
-                    dW = int(W//2 * args.precrop_frac)
+                    # 执行precrop_iters次计算，进行图像中心裁剪区域训练
+                    dH = int(H//2 * args.precrop_frac) # 裁剪区域高度一半
+                    dW = int(W//2 * args.precrop_frac) # 裁剪区域宽度一半
                     coords = torch.stack(
                         torch.meshgrid(
                             torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH), 
                             torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
-                        ), -1)
+                        ), -1) # 裁剪区域组成的meshgrid [2*dH, 2*dW， 2]
                     if i == start:
                         print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")                
                 else:
+                    # 不裁剪，使用所有像素
                     coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
-
+                # 将coords reshape为 [H*W, 2]
                 coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+                # 随机选择
                 select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
                 rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
